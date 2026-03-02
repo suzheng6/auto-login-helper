@@ -1,0 +1,8 @@
+keyboard
+requests
+beautifulsoup4
+PyQt5
+Pillow
+telethon
+tgcrypto
+opentele @ git+https://github.com/AlreadyNobody/OpenTele-3.13.git@main

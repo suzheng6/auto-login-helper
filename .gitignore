@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.session
+*.session-journal
+dist/
+build/
+*.spec
+config.json
+sessions/
+error_log.txt
+.api_id
+*.exe
+*.exe.new
+updater.py
