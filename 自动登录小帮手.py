@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "suzheng6/auto-login-helper"
 
 # Telethon 用于直接调用 Telegram API 登录（抓包复现请求）
@@ -634,43 +634,6 @@ class SyncToAyuGramWorker(QThread):
     finished_ok = pyqtSignal(str)
     finished_fail = pyqtSignal(str)
 
-    _SYNC_SCRIPT = r'''
-import sys, asyncio, os
-session_path, tdata_dir = sys.argv[1], sys.argv[2]
-api_id, api_hash = int(sys.argv[3]), sys.argv[4]
-phone = sys.argv[5] if len(sys.argv) > 5 else ""
-pass2fa = sys.argv[6] if len(sys.argv) > 6 else ""
-from opentele.tl import TelegramClient as OTeleClient
-from opentele.td import TDesktop, Account
-from opentele.api import API, UseCurrentSession, CreateNewSession
-async def sync():
-    if phone:
-        api = API.TelegramDesktop.Generate(system="windows", unique_id=phone)
-    else:
-        api = API.TelegramDesktop
-    client = OTeleClient(session=session_path, api=api)
-    await client.connect()
-    if not await client.is_user_authorized():
-        print("ERR:会话未授权", flush=True); return
-    os.makedirs(tdata_dir, exist_ok=True)
-    # 加载已有 tdata（如果存在），将新账号追加进去而不是覆盖
-    tdesk = TDesktop(tdata_dir, api=API.TelegramDesktop)
-    if tdesk.isLoaded():
-        existing_ids = {acc.UserId for acc in tdesk.accounts}
-        me = await client.get_me()
-        if me.id in existing_ids:
-            print("OK:SKIP already exists", flush=True)
-            await client.disconnect()
-            return
-        await Account.FromTelethon(client, flag=CreateNewSession, owner=tdesk, api=api, password=pass2fa or None)
-    else:
-        tdesk = await TDesktop.FromTelethon(client, flag=CreateNewSession, api=api, password=pass2fa or None)
-    tdesk.SaveTData(tdata_dir)
-    print("OK", flush=True)
-    await client.disconnect()
-asyncio.run(sync())
-'''
-
     def __init__(self, session_path, tdata_dir, api_id, api_hash, phone="", pass2fa=""):
         super().__init__()
         self.session_path = session_path
@@ -680,15 +643,29 @@ asyncio.run(sync())
         self.phone = phone
         self.pass2fa = pass2fa
 
+    @staticmethod
+    def _find_sync_exe():
+        """定位 sync_tdata 可执行文件（兼容打包 EXE 和脚本模式）。"""
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+            exe_path = os.path.join(base, "sync_tdata.exe")
+            if os.path.isfile(exe_path):
+                return [exe_path]
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_tdata.py")
+        if os.path.isfile(script):
+            return [sys.executable, script]
+        return None
+
     def run(self):
-        if not OPENETELE_AVAILABLE:
-            self.finished_fail.emit("未安装 opentele")
+        cmd = self._find_sync_exe()
+        if cmd is None:
+            self.finished_fail.emit("找不到 sync_tdata 模块")
             return
         try:
             result = subprocess.run(
-                [sys.executable, "-c", self._SYNC_SCRIPT,
-                 self.session_path, self.tdata_dir,
-                 str(self.api_id), str(self.api_hash), self.phone, self.pass2fa],
+                cmd + [self.session_path, self.tdata_dir,
+                       str(self.api_id), str(self.api_hash),
+                       self.phone, self.pass2fa],
                 capture_output=True, text=True, timeout=60
             )
             output = (result.stdout or "").strip()
