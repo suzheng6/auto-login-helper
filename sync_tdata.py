@@ -22,6 +22,10 @@ def main():
     from opentele.td import TDesktop, Account
     from opentele.api import API, CreateNewSession
 
+    # opentele 默认硬编码单实例最多 3 个账号；AyuGram 支持更多，
+    # 这里运行时放开上限（加账号检查与读取 tdata 都动态读取此类属性）。
+    TDesktop.kMaxAccounts = 100
+
     async def sync():
         if phone:
             api = API.TelegramDesktop.Generate(system="windows", unique_id=phone)
@@ -37,8 +41,16 @@ def main():
 
         os.makedirs(tdata_dir, exist_ok=True)
 
-        tdesk = TDesktop(tdata_dir, api=API.TelegramDesktop)
-        if tdesk.isLoaded():
+        # 尝试加载现有 tdata：AyuGram 已有账号则追加，空目录/读不到则新建
+        tdesk = None
+        try:
+            loaded = TDesktop(tdata_dir, api=API.TelegramDesktop)
+            if loaded.isLoaded():
+                tdesk = loaded
+        except Exception:
+            tdesk = None
+
+        if tdesk is not None:
             existing_ids = {acc.UserId for acc in tdesk.accounts}
             me = await client.get_me()
             if me.id in existing_ids:
