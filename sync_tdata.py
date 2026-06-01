@@ -43,11 +43,13 @@ def main():
 
         # 尝试加载现有 tdata：AyuGram 已有账号则追加，空目录/读不到则新建
         tdesk = None
+        # 注意：opentele 的 OpenTeleException 继承自 BaseException 而非 Exception，
+        # 必须用 except BaseException 才能捕获（空目录/读不到账号时会抛出）。
         try:
             loaded = TDesktop(tdata_dir, api=API.TelegramDesktop)
             if loaded.isLoaded():
                 tdesk = loaded
-        except Exception:
+        except BaseException:
             tdesk = None
 
         if tdesk is not None:
