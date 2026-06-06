@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "suzheng6/auto-login-helper"
 
 # Telethon 用于直接调用 Telegram API 登录（抓包复现请求）
@@ -808,7 +808,10 @@ class ExtractorApp(QWidget):
                 return
             download_url = exe_asset["browser_download_url"]
             exe_name = exe_asset["name"]
-            QTimer.singleShot(0, lambda: self._prompt_update(remote_ver, download_url, exe_name))
+            # 同时取 sync_tdata.exe，更新主程序时一并更新它
+            sync_asset = next((a for a in assets if a["name"] == "sync_tdata.exe"), None)
+            sync_url = sync_asset["browser_download_url"] if sync_asset else ""
+            QTimer.singleShot(0, lambda: self._prompt_update(remote_ver, download_url, exe_name, sync_url))
         except Exception:
             pass
 
@@ -819,7 +822,7 @@ class ExtractorApp(QWidget):
         except Exception:
             return (0,)
 
-    def _prompt_update(self, new_ver, download_url, exe_name):
+    def _prompt_update(self, new_ver, download_url, exe_name, sync_url=""):
         reply = QMessageBox.question(
             self,
             "发现新版本" if self.current_language == Translations.ZH else "Update Available",
@@ -830,34 +833,68 @@ class ExtractorApp(QWidget):
             QMessageBox.Yes
         )
         if reply == QMessageBox.Yes:
-            self._do_update(download_url, exe_name)
+            self._do_update(download_url, exe_name, sync_url)
 
-    def _do_update(self, download_url, exe_name):
-        """下载新版本 EXE 并替换当前程序。"""
+    @staticmethod
+    def _download_file(url, path):
+        """下载文件到指定路径。"""
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+
+    def _do_update(self, download_url, exe_name, sync_url=""):
+        """下载新版本并替换当前程序，同时一并更新 sync_tdata.exe。
+
+        用 PowerShell 脚本完成替换：打包后 sys.executable 是主程序自身而非
+        Python 解释器，无法执行 .py 更新脚本；PowerShell 在 Windows 必有，
+        且能正确处理中文路径。
+        """
         self.update_status("正在下载更新…")
         try:
-            r = requests.get(download_url, stream=True, timeout=120)
-            r.raise_for_status()
             current_exe = sys.executable if getattr(sys, 'frozen', False) else None
             if not current_exe:
                 self.update_status("⚠️ 非 EXE 模式，请手动下载更新")
                 return
+
+            # 下载主程序到 .new
             new_path = current_exe + ".new"
-            with open(new_path, "wb") as f:
-                for chunk in r.iter_content(8192):
-                    f.write(chunk)
-            updater_path = os.path.join(self.script_dir, "updater.py")
-            with open(updater_path, "w", encoding="utf-8") as f:
-                f.write(
-                    "import sys,time,shutil,subprocess\n"
-                    "old,new=sys.argv[1],sys.argv[2]\n"
-                    "time.sleep(1)\n"
-                    "try:\n"
-                    "    shutil.move(new,old)\n"
-                    "except: sys.exit(1)\n"
-                    "subprocess.Popen([old])\n"
+            self._download_file(download_url, new_path)
+
+            # 一并下载 sync_tdata.exe（下载失败不阻断主程序更新）
+            sync_path = os.path.join(self.script_dir, "sync_tdata.exe")
+            sync_new = sync_path + ".new"
+            sync_ready = False
+            if sync_url:
+                try:
+                    self._download_file(sync_url, sync_new)
+                    sync_ready = True
+                except Exception:
+                    sync_ready = False
+
+            # 生成 PowerShell 替换脚本（UTF-8 BOM 以正确读取中文路径）
+            ps_path = os.path.join(self.script_dir, "_update.ps1")
+            lines = [
+                "Start-Sleep -Seconds 2",
+                f'Move-Item -LiteralPath "{new_path}" -Destination "{current_exe}" -Force',
+            ]
+            if sync_ready:
+                lines.append(
+                    f'if (Test-Path -LiteralPath "{sync_new}") '
+                    f'{{ Move-Item -LiteralPath "{sync_new}" -Destination "{sync_path}" -Force }}'
                 )
-            subprocess.Popen([sys.executable, updater_path, current_exe, new_path])
+            lines.append(f'Start-Process -FilePath "{current_exe}"')
+            lines.append('Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force')
+            with open(ps_path, "w", encoding="utf-8-sig") as f:
+                f.write("\r\n".join(lines))
+
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-WindowStyle", "Hidden", "-File", ps_path],
+                creationflags=CREATE_NO_WINDOW,
+            )
             QApplication.quit()
         except Exception as e:
             self.update_status(f"⚠️ 更新失败: {e}")
