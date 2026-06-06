@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "suzheng6/auto-login-helper"
 
 # Telethon 用于直接调用 Telegram API 登录（抓包复现请求）
@@ -503,10 +503,13 @@ class LoginWorker(QThread):
         self.api_hash = api_hash
 
     @staticmethod
-    def _fetch_code_from_url(url, max_retries=30, interval=3):
+    def _fetch_code_from_url(url, max_retries=30, interval=3, max_total=90):
         """从 URL 页面提取 id=code 与 id=pass2fa 的值。
-        自动识别限频提示并等待对应秒数后重试。"""
+        自动识别限频提示并等待对应秒数后重试。
+        max_total: 整个取码过程的总时长上限（秒）。超过即放弃，
+        避免冻结/持续限频的账号每轮都等几十秒、累计卡住十几分钟。"""
         last_err = ""
+        deadline = time.time() + max_total
         for attempt in range(max_retries):
             try:
                 r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -525,10 +528,17 @@ class LoginWorker(QThread):
                     wait_match = re.search(r"等待\s*(\d+)\s*秒", err_text)
                     if wait_match:
                         wait_sec = int(wait_match.group(1)) + 2
+                        # 若再等这么久会超出总时限，说明账号多半冻结/长期限频，直接放弃
+                        if time.time() + wait_sec > deadline:
+                            last_err = f"限频需等待 {wait_sec}s，超出取码总时限({max_total}s)，跳过"
+                            break
                         time.sleep(wait_sec)
                         continue
             except Exception as e:
                 last_err = str(e)
+            # 普通轮询间隔，但不超过总时限
+            if time.time() + interval > deadline:
+                break
             time.sleep(interval)
         return "", "", last_err or "轮询超时，页面无 code"
 
@@ -559,7 +569,7 @@ class LoginWorker(QThread):
             if await client.is_user_authorized():
                 self.status_msg.emit(f"已登录: {self.phone}")
                 # 已登录也需要从 URL 获取 2FA 密码，供 tdata 转换使用
-                _, url_pass2fa, _ = self._fetch_code_from_url(self.url, max_retries=1, interval=0)
+                _, url_pass2fa, _ = self._fetch_code_from_url(self.url, max_retries=1, interval=0, max_total=0)
                 self.finished_ok.emit(url_pass2fa)
                 return
 
@@ -789,7 +799,11 @@ class ExtractorApp(QWidget):
             if self._ver_tuple(remote_ver) <= self._ver_tuple(APP_VERSION):
                 return
             assets = data.get("assets", [])
-            exe_asset = next((a for a in assets if a["name"].endswith(".exe")), None)
+            # 优先精确匹配主程序，避免误把 sync_tdata.exe 当成主程序下载替换
+            exe_asset = (
+                next((a for a in assets if a["name"] == "AutoLoginHelper.exe"), None)
+                or next((a for a in assets if a["name"].endswith(".exe")), None)
+            )
             if not exe_asset:
                 return
             download_url = exe_asset["browser_download_url"]
