@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 GITHUB_REPO = "suzheng6/auto-login-helper"
 
 # Telethon 用于直接调用 Telegram API 登录（抓包复现请求）
@@ -576,7 +576,16 @@ class LoginWorker(QThread):
             self.status_msg.emit(f"发送验证码: {self.phone}")
             try:
                 sent = await client.send_code_request(self.phone)
-                self.status_msg.emit(f"验证码已发送 (hash: {sent.phone_code_hash[:8]}…)")
+                # 显示下发方式：Sms 接码平台能收到；App 表示发到了已登录的客户端内，
+                # 接码平台收不到（该号在别处有活跃会话），是取不到码的常见根因。
+                ctype = type(sent.type).__name__.replace("SentCodeType", "")
+                self.status_msg.emit(
+                    f"验证码已发送 (hash: {sent.phone_code_hash[:8]}…, 方式: {ctype})"
+                )
+                if ctype.lower() in ("app", "miniapp"):
+                    self.status_msg.emit(
+                        "⚠️ 验证码通过 Telegram App 内下发（该号在别处已登录），接码平台通常收不到"
+                    )
             except FloodWaitError as e:
                 self.finished_fail.emit(f"频率限制，需等待 {e.seconds} 秒")
                 return
@@ -614,8 +623,23 @@ class LoginWorker(QThread):
                         return
                 except PhoneCodeInvalidError:
                     if attempt == 0:
-                        self.status_msg.emit("验证码无效，重新发码并等待…")
-                        await client.send_code_request(self.phone)
+                        # 无效多半是接码页返回了旧码，先重新取一次（新码可能刚到），
+                        # 拿到不同的码直接重试，避免无谓重发（重发易触发渠道耗尽）
+                        self.status_msg.emit("验证码无效，重新获取验证码…")
+                        await asyncio.sleep(5)
+                        new_code, new_pass, fetch_err = self._fetch_code_from_url(self.url)
+                        if new_code and new_code != code:
+                            code = new_code
+                            if new_pass:
+                                pass2fa = new_pass
+                            continue
+                        # 仍是同一个码/取不到 → 尝试重发一次新码（渠道可能已用尽）
+                        try:
+                            self.status_msg.emit("尝试重新发送验证码…")
+                            await client.send_code_request(self.phone)
+                        except Exception as e:
+                            self.finished_fail.emit(f"无法重发验证码，跳过：{type(e).__name__}")
+                            return
                         await asyncio.sleep(8)
                         code, pass2fa, fetch_err = self._fetch_code_from_url(self.url)
                         if not code:
