@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 GITHUB_REPO = "suzheng6/auto-login-helper"
 
 # Telethon 用于直接调用 Telegram API 登录（抓包复现请求）
@@ -503,11 +503,13 @@ class LoginWorker(QThread):
         self.api_hash = api_hash
 
     @staticmethod
-    def _fetch_code_from_url(url, max_retries=30, interval=3, max_total=90):
+    def _fetch_code_from_url(url, max_retries=30, interval=3, max_total=90, exclude_code=""):
         """从 URL 页面提取 id=code 与 id=pass2fa 的值。
         自动识别限频提示并等待对应秒数后重试。
         max_total: 整个取码过程的总时长上限（秒）。超过即放弃，
-        避免冻结/持续限频的账号每轮都等几十秒、累计卡住十几分钟。"""
+        避免冻结/持续限频的账号每轮都等几十秒、累计卡住十几分钟。
+        exclude_code: 若页面返回的码等于该值，视为“旧码未更新”，继续等待新码。
+        用于发码后只取本次新下发的码，避免抓到上一次残留的旧码导致无效。"""
         last_err = ""
         deadline = time.time() + max_total
         for attempt in range(max_retries):
@@ -519,8 +521,10 @@ class LoginWorker(QThread):
                 pass_el = soup.find("input", {"id": "pass2fa"})
                 code = (code_el.get("value") or "").strip() if code_el else ""
                 pass2fa = (pass_el.get("value") or "").strip() if pass_el else ""
-                if code:
+                if code and code != exclude_code:
                     return code, pass2fa, ""
+                if code and code == exclude_code:
+                    last_err = "页面仍是旧验证码，等待新码…"
                 err_el = soup.find(class_="error-message")
                 if err_el:
                     err_text = err_el.get_text(strip=True)
@@ -573,6 +577,12 @@ class LoginWorker(QThread):
                 self.finished_ok.emit(url_pass2fa)
                 return
 
+            # 发码前先记录页面当前残留的旧码，发码后只接受“与它不同”的新码，
+            # 避免抓到上一次的旧码（接码页码值有延迟，等满 5 秒也可能还是旧码）。
+            baseline_code, _, _ = self._fetch_code_from_url(
+                self.url, max_retries=1, interval=0, max_total=0
+            )
+
             self.status_msg.emit(f"发送验证码: {self.phone}")
             try:
                 sent = await client.send_code_request(self.phone)
@@ -601,7 +611,9 @@ class LoginWorker(QThread):
             await asyncio.sleep(5)
 
             self.status_msg.emit("从 URL 获取验证码…")
-            code, pass2fa, fetch_err = self._fetch_code_from_url(self.url)
+            code, pass2fa, fetch_err = self._fetch_code_from_url(
+                self.url, exclude_code=baseline_code
+            )
             if not code:
                 self.finished_fail.emit(f"未能从 URL 获取验证码 ({fetch_err})")
                 return
@@ -623,17 +635,18 @@ class LoginWorker(QThread):
                         return
                 except PhoneCodeInvalidError:
                     if attempt == 0:
-                        # 无效多半是接码页返回了旧码，先重新取一次（新码可能刚到），
-                        # 拿到不同的码直接重试，避免无谓重发（重发易触发渠道耗尽）
-                        self.status_msg.emit("验证码无效，重新获取验证码…")
+                        # 无效多半是抓到了旧码，等待“与失败码不同”的新码再试
+                        self.status_msg.emit("验证码无效，等待新验证码…")
                         await asyncio.sleep(5)
-                        new_code, new_pass, fetch_err = self._fetch_code_from_url(self.url)
-                        if new_code and new_code != code:
+                        new_code, new_pass, fetch_err = self._fetch_code_from_url(
+                            self.url, exclude_code=code
+                        )
+                        if new_code:
                             code = new_code
                             if new_pass:
                                 pass2fa = new_pass
                             continue
-                        # 仍是同一个码/取不到 → 尝试重发一次新码（渠道可能已用尽）
+                        # 等不到新码 → 尝试重发一次（渠道可能已用尽，失败则干净跳过）
                         try:
                             self.status_msg.emit("尝试重新发送验证码…")
                             await client.send_code_request(self.phone)
@@ -641,7 +654,9 @@ class LoginWorker(QThread):
                             self.finished_fail.emit(f"无法重发验证码，跳过：{type(e).__name__}")
                             return
                         await asyncio.sleep(8)
-                        code, pass2fa, fetch_err = self._fetch_code_from_url(self.url)
+                        code, pass2fa, fetch_err = self._fetch_code_from_url(
+                            self.url, exclude_code=code
+                        )
                         if not code:
                             self.finished_fail.emit(f"重试后仍未获取到验证码 ({fetch_err})")
                             return
